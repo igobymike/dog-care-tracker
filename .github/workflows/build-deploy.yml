@@ -30,6 +30,7 @@ name: Build & Deploy
 # ---- EDIT THESE for your app ----
 env:
   APP_NAME: DogCareTracker                    # Must match config.json app.name
+  BUNDLE_ID: com.baiteks.DogCareTracker       # Must match the app bundle identifier
   XCODE_PROJECT: DogCareTracker.xcodeproj    # Your .xcodeproj path
   XCODE_SCHEME: DogCareTracker               # Your Xcode scheme name
   APP_DIR: DogCareTracker                     # Directory containing your .xcodeproj
@@ -232,7 +233,8 @@ jobs:
               "artifact": "${{ needs.build.outputs.artifact_name }}",
               "run_id": "${{ github.run_id }}",
               "repo": "${{ github.repository }}",
-              "app_name": "${{ env.APP_NAME }}"
+              "app_name": "${{ env.APP_NAME }}",
+              "bundle_id": "${{ env.BUNDLE_ID }}"
             }')
 
           STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
