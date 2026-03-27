@@ -1,0 +1,247 @@
+# =============================================================================
+# iOS OTA Build & Deploy Pipeline (ios-deploy-kit template)
+# =============================================================================
+#
+# WHAT THIS DOES:
+#   git push → GitHub macOS runner → build → sign → upload artifact
+#   → webhook → your server downloads .ipa → stages for OTA → APNs push
+#   → user taps notification → iOS installs via itms-services://
+#
+# NO MAC NEEDED. The ASC API key lets xcodebuild auto-manage profiles on CI.
+#
+# SETUP:
+#   1. Copy this file to .github/workflows/build-deploy.yml in your repo
+#   2. Edit the env vars below to match your app
+#   3. Set the required GitHub secrets (see docs/SECRETS.md)
+#
+# REQUIRED GITHUB SECRETS:
+#   SIGNING_CERTIFICATE_P12        - Base64-encoded .p12 signing cert
+#   SIGNING_CERTIFICATE_PASSWORD   - Password for the .p12
+#   ASC_KEY_P8                     - Base64-encoded App Store Connect API key (.p8)
+#   ASC_KEY_ID                     - App Store Connect API key ID
+#   ASC_ISSUER_ID                  - App Store Connect Issuer ID
+#   TEAM_ID                        - Apple Developer Team ID
+#   DEPLOY_WEBHOOK_TOKEN           - Token for your deploy webhook
+#   DEPLOY_WEBHOOK_URL             - Your webhook URL (e.g., https://myapp.example.com/api/deploy/ios)
+# =============================================================================
+
+name: Build & Deploy
+
+# ---- EDIT THESE for your app ----
+env:
+  APP_NAME: DogCareTracker                    # Must match config.json app.name
+  XCODE_PROJECT: DogCareTracker.xcodeproj    # Your .xcodeproj path
+  XCODE_SCHEME: DogCareTracker               # Your Xcode scheme name
+  APP_DIR: DogCareTracker                     # Directory containing your .xcodeproj
+# ----------------------------------
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'DogCareTracker/**'                   # EDIT: match your app directory
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Trigger deployment after build'
+        required: false
+        default: 'true'
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build iOS App
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    outputs:
+      artifact_name: ${{ steps.set_artifact.outputs.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          echo "Xcode: $(xcodebuild -version | head -1)"
+
+      - name: Install Signing Certificate
+        env:
+          SIGNING_CERTIFICATE_P12: ${{ secrets.SIGNING_CERTIFICATE_P12 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$SIGNING_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
+
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import /tmp/certificate.p12 \
+            -P "$SIGNING_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"')
+
+          rm /tmp/certificate.p12
+          echo "Certificate installed"
+
+      - name: Install ASC API Key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p ~/private_keys
+          echo "$ASC_KEY_P8" | base64 --decode > ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          echo "ASC API key installed: AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Bump Build Number
+        run: |
+          PLIST="${APP_DIR}/${APP_NAME}/Resources/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "$PLIST"
+          echo "CFBundleVersion set to ${{ github.run_number }}"
+
+      - name: Build & Archive
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          cd ${{ env.APP_DIR }}
+
+          xcodebuild \
+            -project ${{ env.XCODE_PROJECT }} \
+            -scheme ${{ env.XCODE_SCHEME }} \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/${{ env.APP_NAME }}.xcarchive" \
+            CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION=YES \
+            DEVELOPMENT_TEAM="${{ secrets.TEAM_ID }}" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            archive \
+            2>&1 | tail -40
+
+          echo "Archive complete"
+          ls -la "$RUNNER_TEMP/${{ env.APP_NAME }}.xcarchive/"
+
+      - name: Export IPA
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          cat > /tmp/ExportOptions.plist << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>development</string>
+              <key>teamID</key>
+              <string>${{ secrets.TEAM_ID }}</string>
+              <key>signingStyle</key>
+              <string>automatic</string>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>compileBitcode</key>
+              <false/>
+              <key>thinning</key>
+              <string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$RUNNER_TEMP/${{ env.APP_NAME }}.xcarchive" \
+            -exportOptionsPlist /tmp/ExportOptions.plist \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            2>&1 | tail -15
+
+          echo "IPA exported"
+          ls -lh "$RUNNER_TEMP/export/"
+
+      - name: Set Artifact Name
+        id: set_artifact
+        run: |
+          NAME="${{ env.APP_NAME }}-${{ github.sha }}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set_artifact.outputs.name }}
+          path: ${{ runner.temp }}/export/${{ env.APP_NAME }}.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Clean Up
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
+          rm -rf ~/private_keys 2>/dev/null || true
+
+  # ===========================================================================
+  # JOB 2: Trigger deploy → OTA staging → APNs push to phone
+  # ===========================================================================
+  deploy:
+    name: Deploy to iPhone
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy == 'true')
+
+    steps:
+      - name: Trigger Deploy Webhook
+        env:
+          DEPLOY_WEBHOOK_TOKEN: ${{ secrets.DEPLOY_WEBHOOK_TOKEN }}
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+        run: |
+          echo "Triggering deploy for commit ${{ github.sha }}..."
+
+          # Default URL if secret not set
+          WEBHOOK_URL="${DEPLOY_WEBHOOK_URL:-https://example.com/api/deploy/ios}"
+
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+            -X POST "$WEBHOOK_URL" \
+            -H "Authorization: Bearer $DEPLOY_WEBHOOK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "sha": "${{ github.sha }}",
+              "ref": "${{ github.ref }}",
+              "artifact": "${{ needs.build.outputs.artifact_name }}",
+              "run_id": "${{ github.run_id }}"
+            }')
+
+          STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | grep -v "HTTP_STATUS:")
+
+          echo "Response status: $STATUS"
+          echo "Response body: $BODY"
+
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "202" ]; then
+            echo "Deploy webhook returned $STATUS — check your server"
+            exit 0
+          fi
+
+          echo "Deploy triggered"
