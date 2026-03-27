@@ -230,7 +230,9 @@ jobs:
               "sha": "${{ github.sha }}",
               "ref": "${{ github.ref }}",
               "artifact": "${{ needs.build.outputs.artifact_name }}",
-              "run_id": "${{ github.run_id }}"
+              "run_id": "${{ github.run_id }}",
+              "repo": "${{ github.repository }}",
+              "app_name": "${{ env.APP_NAME }}"
             }')
 
           STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
